@@ -45,7 +45,7 @@ locals {
 }
 
 # -----------------------------------------------------------------------------
-# GCP: VPC, Cloud Router, HA VPN gateway
+# VPN Configuration
 # -----------------------------------------------------------------------------
 module "gcp_vpc" {
   source                          = "./modules/gcp/vpc"
@@ -132,9 +132,6 @@ resource "google_compute_ha_vpn_gateway" "ha_gateway" {
   network = module.gcp_vpc.vpc_name
 }
 
-# -----------------------------------------------------------------------------
-# AWS: VPC, VGW, customer gateways, VPN connections
-# -----------------------------------------------------------------------------
 module "aws_vpc" {
   source                  = "./modules/aws/vpc"
   vpc_name                = "aws-vpc"
@@ -192,9 +189,6 @@ resource "aws_customer_gateway" "gcp_cgw_1" {
   }
 }
 
-# Inside CIDRs must be /30s in 169.254.0.0/16 and must avoid the AWS-reserved
-# blocks (169.254.0.0/30 - 169.254.5.0/30, 169.254.169.252/30). In each /30,
-# .1 is the AWS VGW and .2 is the GCP Cloud Router interface.
 resource "aws_vpn_connection" "vpn_conn_0" {
   vpn_gateway_id      = aws_vpn_gateway.vpn_gw.id
   customer_gateway_id = aws_customer_gateway.gcp_cgw_0.id
@@ -233,9 +227,6 @@ resource "aws_vpn_connection" "vpn_conn_1" {
   }
 }
 
-# -----------------------------------------------------------------------------
-# GCP side of the VPN: external gateway, 4 tunnels, router interfaces, BGP peers
-# -----------------------------------------------------------------------------
 resource "google_compute_external_vpn_gateway" "external_gw" {
   name            = "peer-gw"
   redundancy_type = "FOUR_IPS_REDUNDANCY"
@@ -297,289 +288,267 @@ resource "google_compute_router_peer" "bgp_peer" {
   advertised_route_priority = 100
 }
 
-# -----------------------------------------------------------------------------
-# IAM role & instance profile (SSM access, no SSH keys)
-# -----------------------------------------------------------------------------
-data "aws_iam_policy_document" "ec2_assume_role" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
+# -----------------------------------------------------------------------------------------
+# GCP Application configuration
+# -----------------------------------------------------------------------------------------
+module "instance_template" {
+  source = "./modules/gcp/launch-template"
+
+  region     = var.producer_region
+  project_id = data.google_project.project.project_id
+
+  name_prefix       = var.instance_template_name_prefix
+  machine_type      = var.instance_template_machine_type
+  source_image      = data.google_compute_image.ubuntu_2404.self_link
+  boot_disk_size_gb = var.boot_disk_size_gb
+  boot_disk_type    = var.boot_disk_type
+
+  network          = module.producer_vpc.self_link
+  subnetwork       = module.producer_vpc.subnets_by_name[var.mig_subnet_name].self_link
+  assign_public_ip = false
+  network_tags     = [var.producer_instance_tag]
+
+  create_service_account = true
+  service_account_roles  = var.service_account_roles
+
+  startup_script = templatefile("${path.module}/scripts/user_data.sh", {})
+
+  labels = var.common_labels
+}
+
+module "mig" {
+  source = "./modules/gcp/mig"
+
+  project_id = var.project_id
+  name       = var.mig_name
+  region     = var.producer_region
+
+  instance_template = module.instance_template.self_link_unique
+
+  named_ports = [
+    { name = var.mig_named_port_name, port = var.mig_named_port_number }
+  ]
+
+  health_check = {
+    type         = var.mig_health_check_type
+    port         = var.mig_health_check_port
+    request_path = var.mig_health_check_request_path
+  }
+
+  autoscaling_enabled = true
+  autoscaler_name     = "mig-autoscaler"
+  min_replicas        = var.mig_autoscaling_min_replicas
+  max_replicas        = var.mig_autoscaling_max_replicas
+
+  labels = var.common_labels
+}
+
+module "lb" {
+  source             = "./modules/gcp/lb"
+  project_id         = var.project_id
+  name               = var.lb_name
+  load_balancer_type = var.lb_type
+  region             = var.producer_region
+  network            = module.producer_vpc.self_link
+  subnetwork         = module.producer_vpc.subnets_by_name[var.lb_subnet_name].self_link
+
+  create_proxy_only_subnet = true
+  proxy_only_subnet_cidr   = var.proxy_only_subnet_cidr
+
+  backends = {
+    lb = {
+      is_default          = true
+      protocol            = var.lb_backend_protocol
+      port_name           = var.lb_backend_port_name
+      health_check_id     = module.mig.health_check_id
+      manage_health_check = false
+      groups = [
+        {
+          group           = module.mig.instance_group_self_link
+          balancing_mode  = var.lb_balancing_mode
+          capacity_scaler = var.lb_capacity_scaler
+          max_utilization = var.lb_max_utilization
+        }
+      ]
     }
   }
+
+  allow_global_access     = var.lb_allow_global_access
+  enable_ssl              = var.lb_enable_ssl
+  enable_http             = var.lb_enable_http
+  managed_ssl_certificate = var.lb_managed_ssl_certificate
+  enable_cloud_armor      = var.lb_enable_cloud_armor
+  depends_on              = [module.mig]
 }
 
-resource "aws_iam_role" "app_role" {
-  name_prefix        = "${var.environment}-app-role-"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+# -----------------------------------------------------------------------------------------
+# AWS Application configuration ( Public Application)
+# -----------------------------------------------------------------------------------------
+resource "aws_iam_role" "ec2_role" {
+  name = var.ec2_role
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
 }
 
-resource "aws_iam_role_policy_attachment" "ssm_core" {
-  role       = aws_iam_role.app_role.name
+resource "aws_iam_instance_profile" "iam_instance_profile" {
+  name = "${var.ec2_role}-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_instance_profile" "app_profile" {
-  name_prefix = "${var.environment}-app-profile-"
-  role        = aws_iam_role.app_role.name
+resource "aws_iam_role_policy_attachment" "cloudwatch" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
-# -----------------------------------------------------------------------------
-# Security groups (chained: GCP LB ranges -> NLB -> app instances)
-# -----------------------------------------------------------------------------
-module "nlb_sg" {
-  source = "./modules/aws/security-groups"
-  name   = "nlb-sg"
-  vpc_id = module.aws_vpc.vpc_id
-
-  ingress_rules = [
-    {
-      description     = "HTTP from Google LB / health check ranges arriving over the VPN"
-      from_port       = 80
-      to_port         = 80
-      protocol        = "tcp"
-      security_groups = []
-      cidr_blocks     = var.gcp_lb_source_cidrs
-    }
-  ]
-
-  egress_rules = [
-    {
-      description = "Forward to targets inside the VPC"
-      from_port   = 0
-      to_port     = 0
-      protocol    = "-1"
-      cidr_blocks = ["10.0.0.0/16"]
-    }
-  ]
-
-  tags = {
-    Name = "nlb-sg"
-  }
-}
-
-module "app_sg" {
-  source = "./modules/aws/security-groups"
-  name   = "app-sg"
-  vpc_id = module.aws_vpc.vpc_id
-
-  ingress_rules = [
-    {
-      description     = "HTTP only from the NLB security group"
-      from_port       = 80
-      to_port         = 80
-      protocol        = "tcp"
-      security_groups = [module.nlb_sg.id]
-      cidr_blocks     = []
-    }
-  ]
-
-  egress_rules = [
-    {
-      description = "Egress for OS updates / package repositories via NAT"
-      from_port   = 0
-      to_port     = 0
-      protocol    = "-1"
-      cidr_blocks = ["0.0.0.0/0"]
-    }
-  ]
-
-  tags = {
-    Name = "app-sg"
-  }
-}
-
-# -----------------------------------------------------------------------------
-# Internal NLB with a fixed private IP in each private subnet.
-# The hybrid NEG needs stable IPs; ASG instance IPs and ALB node IPs are not.
-# -----------------------------------------------------------------------------
 locals {
-  # .10 in each private subnet (e.g. 10.0.4.10, 10.0.5.10, 10.0.6.10)
-  nlb_private_ips = [for cidr in var.private_subnets : cidrhost(cidr, 10)]
-
-  hybrid_neg_endpoints = [
-    for ip in local.nlb_private_ips : {
-      ip_address = ip
-      port       = 80
-    }
-  ]
+  lb_logs_bucket_name = "lb-logs-${random_id.id.hex}"
 }
 
-module "internal_nlb" {
-  source  = "terraform-aws-modules/alb/aws"
-  version = "~> 9.0"
+data "aws_elb_service_account" "elb_service_account" {}
 
-  name_prefix                      = "int-nl"
-  load_balancer_type               = "network"
-  internal                         = true
-  vpc_id                           = module.aws_vpc.vpc_id
-  security_groups                  = [module.nlb_sg.id]
-  create_security_group            = false
-  enable_cross_zone_load_balancing = true
-  enable_deletion_protection       = var.environment == "prod"
+module "aws_launch_template" {
+  source                               = "./modules/aws/launch_template"
+  name                                 = "launch_template"
+  description                          = "launch_template"
+  ebs_optimized                        = true
+  image_id                             = data.aws_ami.ubuntu.id
+  instance_type                        = var.instance_type
+  instance_initiated_shutdown_behavior = "terminate"
+  instance_profile_name                = aws_iam_instance_profile.iam_instance_profile.name
 
-  subnet_mapping = [
-    for i, cidr in var.private_subnets : {
-      subnet_id            = module.aws_vpc.private_subnets[i]
-      private_ipv4_address = cidrhost(cidr, 10)
+  network_interfaces = [
+    {
+      associate_public_ip_address = false
+      security_groups             = [module.asg_sg.id]
     }
   ]
+
+  metadata_options = {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required" # Enforces IMDSv2
+    http_put_response_hop_limit = 1
+    instance_metadata_tags      = "enabled"
+  }
+
+  user_data = base64encode(templatefile("${path.module}/scripts/user_data.sh", {}))
+}
+
+module "aws_asg" {
+  source                    = "./modules/aws/auto_scaling_group"
+  name                      = "asg"
+  min_size                  = var.min_size
+  max_size                  = var.max_size
+  desired_capacity          = var.desired_capacity
+  health_check_grace_period = 300
+  health_check_type         = "ELB"
+  force_delete              = !var.is_production
+  target_group_arns         = [module.aws_lb.target_groups.lb_target_group.arn]
+  vpc_zone_identifier       = module.aws_vpc.private_subnets
+  launch_template_id        = module.aws_launch_template.id
+  launch_template_version   = "$Latest"
+    }
+
+resource "aws_autoscaling_policy" "cpu_target_tracking" {
+  name                   = "cpu-target-tracking"
+  autoscaling_group_name = module.aws_asg.name
+  policy_type            = "TargetTrackingScaling"
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value     = 60.0
+    disable_scale_in = false
+  }
+}
+
+module "aws_lb_logs" {
+  source      = "./modules/aws/s3"
+  bucket_name = local.lb_logs_bucket_name
+  region      = var.aws_region
+  objects     = []
+  bucket_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSELBAccountWrite"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_elb_service_account.elb_service_account.id}:root"
+        }
+        Action   = "s3:PutObject"
+        Resource = "arn:aws:s3:::${local.lb_logs_bucket_name}/AWSLogs/*"
+      }
+    ]
+  })
+  cors               = []
+  versioning_enabled = "Disabled"
+  force_destroy      = true
+  tags = {
+    Project = "aws-split-horizon-dns"
+  }
+}
+
+module "aws_lb" {
+  source                     = "terraform-aws-modules/alb/aws"
+  name                       = "lb"
+  load_balancer_type         = "application"
+  vpc_id                     = module.aws_vpc.vpc_id
+  subnets                    = module.aws_vpc.private_subnets
+  enable_deletion_protection = var.is_production
+  drop_invalid_header_fields = true
+  ip_address_type            = "ipv4"
+  internal                   = false
+
+  security_groups = [
+    module.aws_lb_sg.id
+  ]
+
+  access_logs = {
+    bucket = "${module.aws_lb_logs.bucket}"
+  }
 
   listeners = {
-    tcp_80 = {
+    lb_http_listener = {
       port     = 80
-      protocol = "TCP"
+      protocol = "HTTP"
       forward = {
-        target_group_key = "app"
+        target_group_key = "lb_target_group"
       }
     }
   }
 
   target_groups = {
-    app = {
-      name_prefix          = "app-tg"
-      backend_protocol     = "TCP"
-      backend_port         = 80
-      target_type          = "instance"
-      deregistration_delay = 30
-      preserve_client_ip   = false # targets see NLB IPs, so app_sg can reference nlb_sg
-      create_attachment    = false # attached via the ASG
-
+    lb_target_group = {
+      backend_protocol = "HTTP"
+      backend_port     = 80
+      target_type      = "instance"
       health_check = {
         enabled             = true
-        protocol            = "HTTP"
+        healthy_threshold   = 3
+        interval            = 30
         path                = "/"
-        port                = "traffic-port"
-        matcher             = "200"
-        interval            = 10 # NLB only allows 10 or 30
-        healthy_threshold   = 3  # NLB requires healthy == unhealthy
+        port                = 80
+        protocol            = "HTTP"
         unhealthy_threshold = 3
       }
+      create_attachment = false
     }
   }
 
-  tags = merge(var.tags, {
-    Name = "${var.environment}-internal-nlb"
-  })
-}
-
-# -----------------------------------------------------------------------------
-# Launch template + ASG
-# -----------------------------------------------------------------------------
-module "aws_launch_template" {
-  source                               = "./modules/aws/launch_template"
-  name                                 = "aws-launch-template"
-  description                          = "aws-launch-template"
-  ebs_optimized                        = false
-  image_id                             = data.aws_ami.ubuntu.id
-  instance_type                        = var.instance_type
-  instance_initiated_shutdown_behavior = "stop"
-  instance_profile_name                = aws_iam_instance_profile.app_profile.name
-
-  network_interfaces = [
-    {
-      associate_public_ip_address = false
-      security_groups             = [module.app_sg.id]
-    }
-  ]
-
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    set -xe
-
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y nginx curl
-
-    # IMDSv2 metadata
-    TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
-    INSTANCE_ID=$(hostname)
-    AZ="unknown"
-    if [ -n "$TOKEN" ]; then
-      INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id || hostname)
-      AZ=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone || echo "unknown")
-    fi
-
-    cat > /var/www/html/index.html <<HTML
-    <!DOCTYPE html>
-    <html>
-    <head><title>Internal Web Service</title></head>
-    <body style="font-family: Arial, sans-serif; text-align: center; margin-top: 50px;">
-      <h2>Hello from Internal NGINX</h2>
-      <p><b>Instance ID:</b> $INSTANCE_ID</p>
-      <p><b>Availability Zone:</b> $AZ</p>
-      <p><b>Status:</b> Healthy</p>
-    </body>
-    </html>
-    HTML
-
-    systemctl enable --now nginx
-  EOF
-  )
-}
-
-module "app_asg" {
-  source                    = "./modules/aws/auto_scaling_group"
-  name                      = "app-asg"
-  min_size                  = var.asg_min_size
-  max_size                  = var.asg_max_size
-  desired_capacity          = var.asg_desired_capacity
-  health_check_type         = "ELB"
-  health_check_grace_period = 180
-  force_delete              = true
-  target_group_arns         = [module.internal_nlb.target_groups["app"].arn]
-  vpc_zone_identifier       = module.aws_vpc.private_subnets
-  launch_template_id        = module.aws_launch_template.id
-  launch_template_version   = "$Latest"
-}
-
-# -----------------------------------------------------------------------------
-# GCP external load balancer -> hybrid NEG -> AWS NLB private IPs (over VPN)
-# -----------------------------------------------------------------------------
-module "hybrid_neg" {
-  source       = "./modules/gcp/network_endpoint_groups/hybrid_neg"
-  project_id   = var.gcp_project_id
-  name         = "hybrid-neg"
-  network      = module.gcp_vpc.vpc_name
-  subnetwork   = module.gcp_vpc.subnets["hybrid-neg-subnet"].name
-  default_port = 80
-  endpoints    = local.hybrid_neg_endpoints
-  zone         = var.gcp_zone
-
-  depends_on = [google_compute_router_peer.bgp_peer]
-}
-
-module "gcp_lb" {
-  source                   = "./modules/gcp/lb"
-  project_id               = var.gcp_project_id
-  name                     = "gcp-lb"
-  load_balancer_type       = "EXTERNAL"
-  region                   = var.gcp_region
-  create_proxy_only_subnet = false
-
-  backends = {
-    lb = {
-      is_default          = true
-      protocol            = "HTTP"
-      port_name           = "http"
-      is_serverless_neg   = false
-      manage_health_check = true
-      health_check = {
-        port         = 80
-        request_path = "/"
-      }
-      groups = [
-        {
-          group                 = module.hybrid_neg.neg_id
-          balancing_mode        = "RATE"
-          max_rate_per_endpoint = 100
-        }
-      ]
-    }
+  tags = {
+    Project = "aws-split-horizon-dns"
   }
-  enable_ssl              = false
-  enable_http             = true
-  managed_ssl_certificate = false
-  enable_cloud_armor      = false
 }

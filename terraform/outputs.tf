@@ -13,11 +13,6 @@ output "gcp_hybrid_neg_name" {
   value       = module.hybrid_neg.neg_name
 }
 
-output "registered_hybrid_endpoints" {
-  description = "AWS NLB static private IPs registered with the GCP Hybrid NEG."
-  value       = local.hybrid_neg_endpoints
-}
-
 output "aws_internal_nlb_dns_name" {
   description = "DNS name of the AWS internal Network Load Balancer."
   value       = module.internal_nlb.dns_name
