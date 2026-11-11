@@ -2,7 +2,7 @@
 resource "aws_s3_bucket" "bucket" {
   bucket        = var.bucket_name
   force_destroy = var.force_destroy
-  region = var.region
+  region        = var.region
   tags = {
     Name = var.bucket_name
   }
@@ -26,7 +26,7 @@ resource "aws_s3_bucket_versioning" "versioning" {
 
 # Bucket cors configuration
 resource "aws_s3_bucket_cors_configuration" "cors" {
-  count = length(var.cors) > 0 ? length(var.cors) : 0
+  count  = length(var.cors) > 0 ? length(var.cors) : 0
   bucket = aws_s3_bucket.bucket.id
   dynamic "cors_rule" {
     for_each = var.cors

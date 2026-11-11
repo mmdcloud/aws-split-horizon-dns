@@ -55,20 +55,20 @@ module "gcp_vpc" {
   routing_mode                    = "GLOBAL"
   subnets = [
     {
-      name                     = "workload-subnet"
+      name                     = var.mig_subnet_name
       region                   = var.gcp_region
       purpose                  = "PRIVATE"
       role                     = "ACTIVE"
       private_ip_google_access = true
-      ip_cidr_range            = "10.10.1.0/24"
+      ip_cidr_range            = var.mig_subnet_cidr
     },
     {
-      name                     = "hybrid-neg-subnet"
+      name                     = var.lb_subnet_name
       region                   = var.gcp_region
       purpose                  = "PRIVATE"
       role                     = "ACTIVE"
       private_ip_google_access = true
-      ip_cidr_range            = "10.20.1.0/24"
+      ip_cidr_range            = var.lb_subnet_cidr
     }
   ]
   firewall_data = [
@@ -291,10 +291,19 @@ resource "google_compute_router_peer" "bgp_peer" {
 # -----------------------------------------------------------------------------------------
 # GCP Application configuration
 # -----------------------------------------------------------------------------------------
-module "instance_template" {
-  source = "./modules/gcp/launch-template"
+data "google_project" "project" {
+  project_id = var.gcp_project_id
+}
 
-  region     = var.producer_region
+data "google_compute_image" "ubuntu_2404" {
+  family  = var.image_family
+  project = var.image_project
+}
+
+module "gcp_instance_template" {
+  source = "./modules/gcp/instance-template"
+
+  region     = var.gcp_region
   project_id = data.google_project.project.project_id
 
   name_prefix       = var.instance_template_name_prefix
@@ -303,27 +312,27 @@ module "instance_template" {
   boot_disk_size_gb = var.boot_disk_size_gb
   boot_disk_type    = var.boot_disk_type
 
-  network          = module.producer_vpc.self_link
-  subnetwork       = module.producer_vpc.subnets_by_name[var.mig_subnet_name].self_link
+  network          = module.gcp_vpc.self_link
+  subnetwork       = module.gcp_vpc.subnets_by_name[var.mig_subnet_name].self_link
   assign_public_ip = false
   network_tags     = [var.producer_instance_tag]
 
   create_service_account = true
   service_account_roles  = var.service_account_roles
 
-  startup_script = templatefile("${path.module}/scripts/user_data.sh", {})
+  startup_script = templatefile("${path.module}/scripts/gcp_user_data.sh", {})
 
   labels = var.common_labels
 }
 
-module "mig" {
+module "gcp_mig" {
   source = "./modules/gcp/mig"
 
-  project_id = var.project_id
+  project_id = var.gcp_project_id
   name       = var.mig_name
-  region     = var.producer_region
+  region     = var.gcp_region
 
-  instance_template = module.instance_template.self_link_unique
+  instance_template = module.gcp_instance_template.self_link_unique
 
   named_ports = [
     { name = var.mig_named_port_name, port = var.mig_named_port_number }
@@ -343,14 +352,14 @@ module "mig" {
   labels = var.common_labels
 }
 
-module "lb" {
+module "gcp_lb" {
   source             = "./modules/gcp/lb"
-  project_id         = var.project_id
+  project_id         = var.gcp_project_id
   name               = var.lb_name
   load_balancer_type = var.lb_type
-  region             = var.producer_region
-  network            = module.producer_vpc.self_link
-  subnetwork         = module.producer_vpc.subnets_by_name[var.lb_subnet_name].self_link
+  region             = var.gcp_region
+  network            = module.gcp_vpc.self_link
+  subnetwork         = module.gcp_vpc.subnets_by_name[var.lb_subnet_name].self_link
 
   create_proxy_only_subnet = true
   proxy_only_subnet_cidr   = var.proxy_only_subnet_cidr
@@ -360,11 +369,11 @@ module "lb" {
       is_default          = true
       protocol            = var.lb_backend_protocol
       port_name           = var.lb_backend_port_name
-      health_check_id     = module.mig.health_check_id
+      health_check_id     = module.gcp_mig.health_check_id
       manage_health_check = false
       groups = [
         {
-          group           = module.mig.instance_group_self_link
+          group           = module.gcp_mig.instance_group_self_link
           balancing_mode  = var.lb_balancing_mode
           capacity_scaler = var.lb_capacity_scaler
           max_utilization = var.lb_max_utilization
@@ -378,12 +387,74 @@ module "lb" {
   enable_http             = var.lb_enable_http
   managed_ssl_certificate = var.lb_managed_ssl_certificate
   enable_cloud_armor      = var.lb_enable_cloud_armor
-  depends_on              = [module.mig]
+  depends_on              = [module.gcp_mig]
 }
 
 # -----------------------------------------------------------------------------------------
 # AWS Application configuration ( Public Application)
 # -----------------------------------------------------------------------------------------
+module "aws_lb_sg" {
+  source = "./modules/aws/security-groups"
+  name   = "aws-lb-sg"
+  vpc_id = module.aws_vpc.vpc_id
+  ingress_rules = [
+    {
+      description     = "HTTP from Internet"
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      cidr_blocks     = []
+      prefix_list_ids = []
+      security_groups = ["0.0.0.0/0"]
+    }
+  ]
+  egress_rules = [
+    {
+      description     = "Allow outbound HTTP traffic to ASG targets in private subnets"
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      cidr_blocks     = var.private_subnets
+      security_groups = []
+      prefix_list_ids = []
+    }
+  ]
+  tags = {
+    Name = "lb-sg"
+  }
+}
+
+module "aws_asg_sg" {
+  source = "./modules/aws/security-groups"
+  name   = "aws-asg-sg"
+  vpc_id = module.aws_vpc.vpc_id
+  ingress_rules = [
+    {
+      description     = "HTTP Traffic"
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      security_groups = [module.aws_lb_sg.id]
+      prefix_list_ids = []
+      cidr_blocks     = []
+    }
+  ]
+  egress_rules = [
+    {
+      description     = "Allow outbound HTTP"
+      from_port       = 80
+      to_port         = 80
+      protocol        = "tcp"
+      cidr_blocks     = ["0.0.0.0/0"]
+      security_groups = []
+      prefix_list_ids = []
+    }
+  ]
+  tags = {
+    Name = "aws-asg-sg"
+  }
+}
+
 resource "aws_iam_role" "ec2_role" {
   name = var.ec2_role
   assume_role_policy = jsonencode({
@@ -413,6 +484,10 @@ resource "aws_iam_role_policy_attachment" "cloudwatch" {
   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
+resource "random_id" "id" {
+  byte_length = 4
+}
+
 locals {
   lb_logs_bucket_name = "lb-logs-${random_id.id.hex}"
 }
@@ -432,7 +507,7 @@ module "aws_launch_template" {
   network_interfaces = [
     {
       associate_public_ip_address = false
-      security_groups             = [module.asg_sg.id]
+      security_groups             = [module.aws_asg_sg.id]
     }
   ]
 
@@ -443,23 +518,23 @@ module "aws_launch_template" {
     instance_metadata_tags      = "enabled"
   }
 
-  user_data = base64encode(templatefile("${path.module}/scripts/user_data.sh", {}))
+  user_data = base64encode(templatefile("${path.module}/scripts/aws_user_data.sh", {}))
 }
 
 module "aws_asg" {
   source                    = "./modules/aws/auto_scaling_group"
   name                      = "asg"
-  min_size                  = var.min_size
-  max_size                  = var.max_size
-  desired_capacity          = var.desired_capacity
+  min_size                  = 1
+  max_size                  = 2
+  desired_capacity          = 1
   health_check_grace_period = 300
   health_check_type         = "ELB"
-  force_delete              = !var.is_production
+  force_delete              = true
   target_group_arns         = [module.aws_lb.target_groups.lb_target_group.arn]
   vpc_zone_identifier       = module.aws_vpc.private_subnets
   launch_template_id        = module.aws_launch_template.id
   launch_template_version   = "$Latest"
-    }
+}
 
 resource "aws_autoscaling_policy" "cpu_target_tracking" {
   name                   = "cpu-target-tracking"
@@ -496,9 +571,7 @@ module "aws_lb_logs" {
   cors               = []
   versioning_enabled = "Disabled"
   force_destroy      = true
-  tags = {
-    Project = "aws-split-horizon-dns"
-  }
+
 }
 
 module "aws_lb" {
@@ -507,7 +580,7 @@ module "aws_lb" {
   load_balancer_type         = "application"
   vpc_id                     = module.aws_vpc.vpc_id
   subnets                    = module.aws_vpc.private_subnets
-  enable_deletion_protection = var.is_production
+  enable_deletion_protection = false
   drop_invalid_header_fields = true
   ip_address_type            = "ipv4"
   internal                   = false
@@ -551,4 +624,131 @@ module "aws_lb" {
   tags = {
     Project = "aws-split-horizon-dns"
   }
+}
+
+# =============================================================================
+# Split-Horizon DNS Configuration
+# =============================================================================
+# Split-horizon (split-view) DNS routes queries for the domain based on source:
+#
+# 1. Public Horizon (Internet Clients):
+#    Queries from the public internet for the domain (e.g. internal.mohitd.xyz or mohitd.xyz)
+#    are resolved by Route 53 Public Hosted Zone to the public-facing AWS
+#    Application Load Balancer (module.aws_lb).
+#
+# 2. Private Horizon (Internal VPC Clients):
+#    Queries from within the AWS VPC are resolved by Route 53 Private Hosted Zone
+#    to the internal load balancer private IP (module.gcp_lb.lb_ip_address) across the HA VPN.
+#    Queries from within the GCP VPC are resolved by Google Cloud DNS Private
+#    Managed Zone to the GCP Internal Load Balancer (module.gcp_lb.lb_ip_address).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Public Horizon - AWS Route 53 Public Hosted Zone & Records
+# -----------------------------------------------------------------------------
+resource "aws_route53_zone" "public" {
+  name    = var.dns_name
+  comment = "Public hosted zone for split-horizon DNS (${var.dns_name})"
+
+  tags = merge(var.tags, {
+    Name        = "${var.dns_name}-public"
+    Horizon     = "public"
+    Environment = var.environment
+  })
+}
+
+# Public A record (alias) pointing to the AWS Public Application Load Balancer
+resource "aws_route53_record" "public_record" {
+  zone_id = aws_route53_zone.public.zone_id
+  name    = var.dns_record_prefix != "" ? "${var.dns_record_prefix}.${var.dns_name}" : var.dns_name
+  type    = "A"
+
+  alias {
+    name                   = module.aws_lb.dns_name
+    zone_id                = module.aws_lb.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# Public Apex A record (alias) pointing to the AWS Public Application Load Balancer
+resource "aws_route53_record" "public_apex" {
+  zone_id = aws_route53_zone.public.zone_id
+  name    = var.dns_name
+  type    = "A"
+
+  alias {
+    name                   = module.aws_lb.dns_name
+    zone_id                = module.aws_lb.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# -----------------------------------------------------------------------------
+# 2. Private Horizon - AWS Route 53 Private Hosted Zone & Records (AWS VPC)
+# -----------------------------------------------------------------------------
+resource "aws_route53_zone" "private" {
+  name    = var.dns_name
+  comment = "Private hosted zone for split-horizon DNS associated with AWS VPC"
+
+  vpc {
+    vpc_id = module.aws_vpc.vpc_id
+  }
+
+  tags = merge(var.tags, {
+    Name        = "${var.dns_name}-private"
+    Horizon     = "private"
+    Environment = var.environment
+  })
+}
+
+# Private A record in Route 53 resolving to internal service endpoint over HA VPN
+resource "aws_route53_record" "private_record" {
+  zone_id = aws_route53_zone.private.zone_id
+  name    = var.dns_record_prefix != "" ? "${var.dns_record_prefix}.${var.dns_name}" : var.dns_name
+  type    = var.dns_record_type
+  ttl     = var.ttl
+  records = [module.gcp_lb.lb_ip_address]
+}
+
+# Private Apex A record in Route 53 resolving to internal service endpoint
+resource "aws_route53_record" "private_apex" {
+  zone_id = aws_route53_zone.private.zone_id
+  name    = var.dns_name
+  type    = var.dns_record_type
+  ttl     = var.ttl
+  records = [module.gcp_lb.lb_ip_address]
+}
+
+# -----------------------------------------------------------------------------
+# 3. Private Horizon - Google Cloud DNS Private Managed Zone & Records (GCP VPC)
+# -----------------------------------------------------------------------------
+resource "google_dns_managed_zone" "private_zone" {
+  name        = var.dns_zone_name
+  dns_name    = "${var.dns_name}."
+  description = var.dns_zone_description
+  visibility  = "private"
+
+  private_visibility_config {
+    networks {
+      network_url = module.gcp_vpc.self_link
+    }
+  }
+}
+
+# Private DNS record in Google Cloud DNS resolving to GCP Internal Load Balancer
+resource "google_dns_record_set" "private_record" {
+  name         = var.dns_record_prefix != "" ? "${var.dns_record_prefix}.${google_dns_managed_zone.private_zone.dns_name}" : google_dns_managed_zone.private_zone.dns_name
+  managed_zone = google_dns_managed_zone.private_zone.name
+  type         = var.dns_record_type
+  ttl          = var.ttl
+  rrdatas      = [module.gcp_lb.lb_ip_address]
+}
+
+# Private Apex DNS record in Google Cloud DNS resolving to GCP Internal Load Balancer
+resource "google_dns_record_set" "private_apex" {
+  name         = google_dns_managed_zone.private_zone.dns_name
+  managed_zone = google_dns_managed_zone.private_zone.name
+  type         = var.dns_record_type
+  ttl          = var.ttl
+  rrdatas      = [module.gcp_lb.lb_ip_address]
 }
